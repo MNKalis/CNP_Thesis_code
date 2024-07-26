@@ -1,0 +1,731 @@
+---
+title: "codingRMD_MNK"
+author: "MNK"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+      toc: true
+      toc_depth: 3
+      number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Packages
+```{r packages, message=FALSE, warning=FALSE}
+if(!requireNamespace("haven")) install.packages("haven"); library(haven)
+if(!requireNamespace("dplyr")) install.packages("dplyr"); library(dplyr)
+if(!requireNamespace("visdat")) install.packages("visdat"); library(visdat)
+if(!requireNamespace("naniar")) install.packages("naniar"); library(naniar)
+if(!requireNamespace("psych")) install.packages("psych"); library(psych)
+if(!requireNamespace("mice")) install.packages("mice"); library(mice)
+if(!requireNamespace("Hmisc")) install.packages("Hmisc"); library(Hmisc)
+if(!requireNamespace("knitr")) install.packages("knitr"); library(knitr)
+if(!requireNamespace("kableExtra")) install.packages("kableExtra"); library(kableExtra)
+if(!requireNamespace("lavaan")) install.packages("lavaan"); library(lavaan)
+
+```
+
+# Loading files (and predefined transformation)
+## EMC data
+```{r EMC data loading}
+setwd("V:/Research/Dementie/Studenten/Studenten/Max/Databeheer")
+
+dataEMC <- haven::read_sav("data_SCTQ_merged_16072024.sav") #load EMC collected data
+dataEMC[dataEMC == 999] <- NA
+
+dataEMC_copy <- dataEMC
+```
+
+## UMCG data
+```{r UMCG data loading}
+setwd("V:/Research/Dementie/Studenten/Studenten/Max/Databeheer")
+dataUMCG <- haven::read_sav("data_SC_UMCG_mnk.sav") #load UMCG collected data
+dataUMCG[dataUMCG == 999] <- NA
+
+dataUMCG_copy <- dataUMCG
+```
+
+# Data preprocessing
+## Pre defined transformation
+```{r}
+dataEMC$TAS20_fac1_tf <- 35 - dataEMC$TAS20_fac1_Identificeren_Gevoelens
+dataUMCG$TAS20_fac1_tf <- 35 - dataUMCG$TAS20_fac1_Identificeren_Gevoelens
+```
+
+## Synchronizing names and compute totals
+```{r}
+dataEMC$FP_1_6_total <- dataEMC$FP_1t6_ToM + dataEMC$FP_1t6_empathy
+colnames(dataUMCG)[which(colnames(dataUMCG) == "SET_UMCG_Totaal")] <- "SET_UMCG_total"
+dataEMC$SET_UMCG_Cognitief_Totaal <- dataEMC$SET_UMCG_1 +dataEMC$SET_UMCG_2 + dataEMC$SET_UMCG_3
+dataEMC$SET_UMCG_Affectief_Totaal <- dataEMC$SET_UMCG_4 +dataEMC$SET_UMCG_5 + dataEMC$SET_UMCG_6
+```
+
+## Creating ID values for UMCG sample
+```{r}
+dataUMCG$ID <- paste0("UMCG", seq(1, nrow(dataUMCG)))
+```
+
+
+## Data pooling
+```{r data pooling, warning=FALSE}
+data_pooled <- dplyr::bind_rows(dataEMC, dataUMCG) # pooling the data
+data_pooled_copy <- data_pooled
+```
+
+## Renaming and var name sets
+```{r Data preprocessing}
+names_relevant_items <- c("Ekman60_total", "ERT_total", "TAS20_fac1_tf", 
+                          "FP_1_6_total", "hintingtask_total", "cartoons_total", "SET_total_mc", "SET_UMCG_total", 
+                          "SNQ_NL_total", "RSMS_AMSP", "MBI_total")
+names_rel_items_abbr <- c('EKM60t', 'ERTt', 'TASf1', 
+                          'FP_Gt', 'HT_Gt', 'CART_Gt', 'SETt', 'SET_Gt',
+                          'SNQt', 'RSMSf1', 'MBIt')
+names(data_pooled)[match(names_relevant_items, names(data_pooled))] <- names_rel_items_abbr #renaming
+names_covariates <- c("age", "sex", "education_level")
+```
+
+## Missing values part 1; visualisation
+```{r}
+vis_miss(data_pooled[,names_rel_items_abbr])
+```
+
+In the above plot it is visible that we miss >=63% of data for four items (ERT, SET, RSMS, MBI). These items were not included in the data collection of UMCG, and therefor we assume that these missing values are missing completely at random (aka the characteristics of these participants did not influence whether this data is present/absent). Data for the UMCH sample will be imputed for those four items using stochastic imputation based the two variables that have the highest and significant correlations with the items.
+
+15% of data is missing for SET_Gt, all these missings are in the EMC data. For those people, SET was conducted with another testing protocol (solely multiple choise question, no open questions). We will impute SET_Gt scores for these people based on means in the EMC sample corrected for their scores on the MC questions.
+
+The 8% missing values for the CART_Gt variable can probably be explained by lack of time (slower participants) because it was the last test in the EMC protocol. We will impute the scores using stochastic imputation based on th two variables that have the highest and significant correlation with this test.
+
+Imputation will be continued after checks for outliers and non-normality.
+
+# Data checks
+## EMC sample data checks
+Descriptes before outlier deletion and/or tranformations
+```{r}
+# Descriptives EMC start
+psych::describe(data_pooled[data_pooled$centerID == "EMC", c(names_covariates, "MoCA_total", names_rel_items_abbr)]) %>%
+  select(n, min, max, mean, median, sd, skew, kurtosis)
+```
+
+### Outliers - EMC
+```{r}
+dataEMC_subset_scaled <- cbind(data_pooled[data_pooled$centerID == "EMC",][, c("ID", names_covariates, "MoCA_total")], scale(data_pooled[data_pooled$centerID == "EMC",][,names_rel_items_abbr]))
+moca_below26_EMC <- dataEMC_subset_scaled$MoCA_total < 26
+
+outlierCheck_EMC <- data.frame(cbind(moca_below26_EMC, abs(dataEMC_subset_scaled[,names_rel_items_abbr])>3))
+#outlierCheck_EMC <- cbind(moca_below26_EMC, sapply(dataEMC_subset_scaled[,names_rel_items_abbr], FUN = function(x) abs(x)>3))
+
+rowSums(outlierCheck_EMC, na.rm = TRUE)
+
+meanitemSS_EMC <- rowMeans(dataEMC_subset_scaled[,c(
+                          'EKM60t', 'ERTt', 'TASf1', 
+                          'FP_Gt', 'CART_Gt', 'SETt',
+                          'SNQt', 'RSMSf1', 'MBIt')], na.rm = TRUE)
+SSmeanitemSS_EMC <- scale(meanitemSS_EMC)
+outlier_EMC <- dataEMC_subset_scaled[which(abs(SSmeanitemSS_EMC)>3), "ID"]
+length(outlier_EMC)
+```
+We have one participant that has an absolute scaled mean item scaled score of over 3, we will exclude this participant from analyses.
+
+```{r}
+data_pooled <- data_pooled[-(which(data_pooled$ID==outlier_EMC)),]
+```
+
+### Normality - EMC
+```{r}
+psych::describe(data_pooled[data_pooled$centerID == "EMC", c(names_covariates, "MoCA_total", names_rel_items_abbr)]) %>%
+  select(n, min, max, mean, median, sd, skew, kurtosis)
+
+normalityCheck_EMC <- psych::describe(data_pooled[data_pooled$centerID == "EMC", c(names_covariates, "MoCA_total", names_rel_items_abbr)]) %>%
+  select(skew, kurtosis)
+
+any(abs(normalityCheck_EMC$skew)>3)
+any(abs(normalityCheck_EMC$kurtosis)>10)
+```
+No absolute skew>3 and no absolute kurtosis>10 is EMC sample after deleting 1 outlier.
+
+
+### Imputing the SET_Gt variable some EMC missings due to different testing protocol
+```{r imputation SET_Gt for EMC missings}
+data_pooled[data_pooled$centerID == "EMC" & is.na(data_pooled$SET_open_2), "SET_open_2"] <- 
+  as.numeric(colMeans(data_pooled[data_pooled$centerID == "EMC", "SET_open_2"], na.rm = TRUE))
+data_pooled[data_pooled$centerID == "EMC" & is.na(data_pooled$SET_open_3), "SET_open_3"] <- 
+  as.numeric(colMeans(data_pooled[data_pooled$centerID == "EMC", "SET_open_3"], na.rm = TRUE))
+data_pooled[data_pooled$centerID == "EMC" & is.na(data_pooled$SET_open_6), "SET_open_6"] <- 
+  as.numeric(colMeans(data_pooled[data_pooled$centerID == "EMC", "SET_open_6"], na.rm = TRUE))
+data_pooled[data_pooled$centerID == "EMC" & is.na(data_pooled$SET_open_14), "SET_open_14"] <- 
+  as.numeric(colMeans(data_pooled[data_pooled$centerID == "EMC", "SET_open_14"], na.rm = TRUE))
+data_pooled[data_pooled$centerID == "EMC" & is.na(data_pooled$SET_open_16), "SET_open_16"] <- 
+  as.numeric(colMeans(data_pooled[data_pooled$centerID == "EMC", "SET_open_16"], na.rm = TRUE))
+data_pooled[data_pooled$centerID == "EMC" & is.na(data_pooled$SET_open_17), "SET_open_17"] <- 
+  as.numeric(colMeans(data_pooled[data_pooled$centerID == "EMC", "SET_open_17"], na.rm = TRUE))
+
+data_pooled[data_pooled$centerID == "EMC", "SET_UMCG_1"] <- 
+  data_pooled[data_pooled$centerID == "EMC",]$SET_open_2 + data_pooled[data_pooled$centerID == "EMC",]$SET_mc_2
+data_pooled[data_pooled$centerID == "EMC", "SET_UMCG_2"] <- 
+  data_pooled[data_pooled$centerID == "EMC",]$SET_open_3 + data_pooled[data_pooled$centerID == "EMC",]$SET_mc_3
+data_pooled[data_pooled$centerID == "EMC", "SET_UMCG_3"] <- 
+  data_pooled[data_pooled$centerID == "EMC",]$SET_open_6 + data_pooled[data_pooled$centerID == "EMC",]$SET_mc_6
+data_pooled[data_pooled$centerID == "EMC", "SET_UMCG_4"] <- 
+  data_pooled[data_pooled$centerID == "EMC",]$SET_open_14 + data_pooled[data_pooled$centerID == "EMC",]$SET_mc_14
+data_pooled[data_pooled$centerID == "EMC", "SET_UMCG_5"] <- 
+  data_pooled[data_pooled$centerID == "EMC",]$SET_open_16 + data_pooled[data_pooled$centerID == "EMC",]$SET_mc_16
+data_pooled[data_pooled$centerID == "EMC", "SET_UMCG_6"] <- 
+  data_pooled[data_pooled$centerID == "EMC",]$SET_open_17 + data_pooled[data_pooled$centerID == "EMC",]$SET_mc_17
+
+data_pooled$SET_Gt <- rowSums(data_pooled[,c(which(names(data_pooled)=="SET_UMCG_1") : which(names(data_pooled)=="SET_UMCG_6"))])
+```
+
+
+## UMCG sample data checks
+Descriptives before outlier deletion and/or tranformations
+```{r, warning=FALSE, message=FALSE}
+# Descriptives UMCG start
+psych::describe(data_pooled[data_pooled$centerID == "UMCG", c(names_covariates, "MoCA_total", names_rel_items_abbr)]) %>%
+  select(n, min, max, mean, median, sd, skew, kurtosis)
+```
+
+### Outliers - UMCG
+```{r}
+dataUMCG_subset_scaled <- cbind(data_pooled[data_pooled$centerID == "UMCG",][, c("ID", names_covariates, "MoCA_total")], scale(data_pooled[data_pooled$centerID == "UMCG",][,names_rel_items_abbr]))
+moca_below26_UMCG <- dataUMCG_subset_scaled$MoCA_total < 26
+
+outlierCheck_UMCG <- data.frame(cbind(moca_below26_UMCG, abs(dataUMCG_subset_scaled[,names_rel_items_abbr])>3))
+#outlierCheck_UMCG <- cbind(moca_below26_UMCG, sapply(dataUMCG_subset_scaled[,names_rel_items_abbr], FUN = function(x) abs(x)>3))
+
+rowSums(outlierCheck_UMCG, na.rm = TRUE)
+
+meanitemSS_UMCG <- rowMeans(dataUMCG_subset_scaled[,c(
+                          'EKM60t', 'ERTt', 'TASf1', 
+                          'FP_Gt', 'CART_Gt', 'SET_Gt',
+                          'SNQt', 'RSMSf1', 'MBIt')], na.rm = TRUE)
+SSmeanitemSS_UMCG <- scale(meanitemSS_UMCG)
+outlier_UMCG <- dataUMCG_subset_scaled[which(abs(SSmeanitemSS_UMCG)>3), "ID"]
+length(outlier_UMCG)
+```
+We have one participant that has an absolute scaled mean item scaled score of over 3, we will exclude this participant from analyses.
+
+```{r}
+data_pooled <- data_pooled[-(which(data_pooled$ID==outlier_UMCG)),]
+```
+
+### Normality - UMCG
+```{r, warning=FALSE, message=FALSE}
+psych::describe(data_pooled[data_pooled$centerID == "UMCG", c(names_covariates, "MoCA_total", names_rel_items_abbr)]) %>%
+  select(n, min, max, mean, median, sd, skew, kurtosis)
+
+normalityCheck_UMCG <- psych::describe(data_pooled[data_pooled$centerID == "UMCG", c(names_covariates, "MoCA_total", names_rel_items_abbr)]) %>%
+  select(skew, kurtosis)
+
+any(abs(normalityCheck_UMCG$skew)>3, na.rm = TRUE)
+any(abs(normalityCheck_UMCG$kurtosis)>10, na.rm = TRUE)
+```
+No absolute skew>3 and no absolute kurtosis>10 is EMC sample after deleting 1 outlier.
+
+
+
+# Stochastic imputation
+At this point, we have the following missing values.
+```{r}
+vis_miss(data_pooled[,c("age", "education_level",names_rel_items_abbr)])
+```
+And the following zero order paired correlation (respectively: corr, N, p-values).
+
+```{r}
+rcorr(as.matrix(data_pooled[, c("age", "education_level", 
+                                        'EKM60t', 'ERTt', 'TASf1', 
+                                        'FP_Gt', 'CART_Gt', 'SET_Gt',
+                                        'SNQt', 'RSMSf1', 'MBIt')]))
+```
+
+## Imputation predictor selection
+### Predictor selection ERTt
+Lets check the correlations of ERTt with other relevant variables.
+
+```{r}
+matcor <- Hmisc:: rcorr(as.matrix(data_pooled[, c("age", "education_level", 
+                                        'EKM60t', 'ERTt', 'TASf1', 
+                                        'FP_Gt', 'HT_Gt', 'CART_Gt', 'SET_Gt',
+                                        'SNQt', 'RSMSf1', 'MBIt')]))
+
+#Check whether sex is also a significant predictor
+sexERTt <- lm(ERTt ~ sex, data = data_pooled)
+summary(sexERTt)$coefficients["sex", "Pr(>|t|)"] #Not significant
+
+sigpred_ERTt <- matcor$r["ERTt",matcor$P["ERTt",]<.05]; sigpred_ERTt #significant correlations of ERTt
+
+# corrplot(matcor$r, p.mat = matcor$P, sig.level = 0.05, method = "number", type = "lower", tl.col = "black", tl.srt = 45,
+#          #insig = "blank", 
+#          addCoef.col = "black")
+```
+
+We will impute the missing ERTt values using predictive mean matching (stochastic) based on the significant predictors.
+
+
+### Predictor selection RSMSf1
+Lets check the correlations of RSMSf1 with other relevant variables.
+
+```{r}
+#Check whether sex is also a significant predictor
+sexRSMSf1 <- lm(RSMSf1 ~ sex, data = data_pooled)
+summary(sexRSMSf1)$coefficients["sex", "Pr(>|t|)"] #Not significant
+
+#Check numerical correlations
+sigpred_RSMSf1 <- matcor$r["RSMSf1",matcor$P["RSMSf1",]<.05]; sigpred_RSMSf1 #significant correlations of RSMSf1
+```
+
+### Predictor selection MBIt
+Lets check the correlations of MBIt with other relevant variables.
+
+```{r}
+#Check whether sex is also a significant predictor
+sexMBIt <- lm(MBIt ~ sex, data = data_pooled)
+summary(sexMBIt)$coefficients["sex", "Pr(>|t|)"] #Not significant
+
+#Check numerical correlations
+sigpred_MBIt <- matcor$r["MBIt",matcor$P["MBIt",]<.05]; sigpred_MBIt #significant correlations of MBIt
+```
+
+
+## Imputation of ERTt, RSMSf, MBIt
+```{r}
+data_pooled_subset <- data_pooled[,c("ID", "centerID", "sex", "age", "education_level", 
+                                        'EKM60t', 'ERTt', 'TASf1', 
+                                        'FP_Gt', 'CART_Gt', 'SET_Gt',
+                                        'SNQt', 'RSMSf1', 'MBIt')]
+
+predictor_matrix <- make.predictorMatrix(data_pooled_subset)
+predictor_matrix[] <- 0
+
+#assign the significant predictors to the prediction matrix
+predictor_matrix["ERTt", ] <- colnames(predictor_matrix) %in% names(sigpred_ERTt)[!is.na(names(sigpred_ERTt))]
+predictor_matrix["RSMSf1", ] <- colnames(predictor_matrix) %in% names(sigpred_RSMSf1)[!is.na(names(sigpred_RSMSf1))]
+predictor_matrix["MBIt", ] <- colnames(predictor_matrix) %in% names(sigpred_MBIt)[!is.na(names(sigpred_MBIt))]
+
+#assign imputation medhods
+imputation_methods <- make.method(data_pooled_subset)
+imputation_methods[] <- ""  # Set all methods to "" initially
+imputation_methods[c("ERTt", "RSMSf1", "MBIt")] <- "pmm"  # Use "pmm" for ERTt
+
+#imputation
+data_pooled_subset_imp <- complete(mice(data_pooled_subset, 
+                               method = imputation_methods, 
+                               predictorMatrix = predictor_matrix, 
+                               m = 1, 
+                               seed = 42), 1)
+```
+
+### Visualisation ERTt impuations
+```{r}
+# Stochastic regression imputation plot for ERTt
+plot(data_pooled_subset$EKM60t[!is.na(data_pooled_subset$ERTt)], data_pooled_subset_imp$ERTt[!is.na(data_pooled_subset$ERTt)],# Plot of observed values
+     main = "Stochastic Regression",
+     xlab = "EKMt", ylab = "ERTt")
+points(data_pooled_subset$EKM60t[is.na(data_pooled_subset$ERTt)], data_pooled_subset_imp$ERTt[is.na(data_pooled_subset$ERTt)],# Plot of missing values
+       col = "red")
+abline(lm(data_pooled_subset$ERTt ~ data_pooled_subset$EKM60t, data_pooled_subset_imp), col = "#1b98e0", lwd = 1.5) # Regression slope
+```
+
+
+### Visualisation RSMSf1 impuations
+```{r}
+# Stochastic regression imputation plot for RSMSf1
+plot(data_pooled_subset$TASf1[!is.na(data_pooled_subset$RSMSf1)], data_pooled_subset_imp$RSMSf1[!is.na(data_pooled_subset$RSMSf1)],# Plot of observed values
+     main = "Stochastic Regression",
+     xlab = "TASf1", ylab = "RSMSf1")
+points(data_pooled_subset$TASf1[is.na(data_pooled_subset$RSMSf1)], data_pooled_subset_imp$RSMSf1[is.na(data_pooled_subset$RSMSf1)],# Plot of missing values
+       col = "red")
+abline(lm(data_pooled_subset$RSMSf1 ~ data_pooled_subset$TASf1, data_pooled_subset_imp), col = "#1b98e0", lwd = 1.5) # Regression slope
+```
+
+### Visualisation MBIt impuations
+```{r}
+# Stochastic regression imputation plot for MBIt
+plot(data_pooled_subset$age[!is.na(data_pooled_subset$MBIt)], data_pooled_subset_imp$MBIt[!is.na(data_pooled_subset$MBIt)],# Plot of observed values
+     main = "Stochastic Regression",
+     xlab = "age", ylab = "MBIt")
+points(data_pooled_subset$age[is.na(data_pooled_subset$MBIt)], data_pooled_subset_imp$MBIt[is.na(data_pooled_subset$MBIt)],# Plot of missing values
+       col = "red")
+abline(lm(data_pooled_subset$MBIt ~ data_pooled_subset$age, data_pooled_subset_imp), col = "#1b98e0", lwd = 1.5) # Regression slope
+
+```
+
+## Mid term missing data evaluation
+At this point, we have the following missing data:
+```{r}
+vis_miss(data_pooled_subset_imp[,-1])
+```
+We will impute the remaining missing values, again with a stochastic approach based on significant correlations or significant t.test for sex.
+
+## Imputation predictor selection part 2
+### Predictor selection CART_Gt
+Lets check the correlations of CART_Gt with other relevant variables.
+
+```{r}
+matcor2 <- Hmisc:: rcorr(as.matrix(data_pooled_subset_imp[, c("age", "education_level", 
+                                        'EKM60t', 'ERTt', 'TASf1', 
+                                        'FP_Gt', 'CART_Gt', 'SET_Gt',
+                                        'SNQt', 'RSMSf1', 'MBIt')]))
+
+#Check whether sex is also a significant predictor
+sexCART_Gt <- lm(CART_Gt ~ sex, data = data_pooled_subset_imp)
+summary(sexCART_Gt)$coefficients["sex", "Pr(>|t|)"] #Significant
+
+sigpred_CART_Gt <- matcor2$r["CART_Gt",matcor2$P["CART_Gt",]<.05]; sigpred_CART_Gt #significant correlations of CART_Gt
+sigpred_CART_Gt$sex <- summary(sexCART_Gt)$coefficients["sex", "Pr(>|t|)"] #Significant
+
+```
+
+### Predictor selection SET_Gt
+Lets check the correlations of SET_Gt with other relevant variables.
+
+```{r}
+
+#Check whether sex is also a significant predictor
+sexSET_Gt <- lm(SET_Gt ~ sex, data = data_pooled_subset_imp)
+summary(sexSET_Gt)$coefficients["sex", "Pr(>|t|)"] #Not ignificant
+
+sigpred_SET_Gt <- matcor2$r["SET_Gt",matcor2$P["SET_Gt",]<.05]; sigpred_SET_Gt #significant correlations of SET_Gt
+```
+
+### Predictor selection EKM60t
+Lets check the correlations of EKM60t with other relevant variables.
+
+```{r}
+#Check whether sex is also a significant predictor
+sexEKM60t <- lm(EKM60t ~ sex, data = data_pooled_subset_imp)
+summary(sexEKM60t)$coefficients["sex", "Pr(>|t|)"] #Not significant
+
+sigpred_EKM60t <- matcor2$r["EKM60t",matcor2$P["EKM60t",]<.05]; sigpred_EKM60t #significant correlations of EKM60t
+```
+
+
+### Predictor selection ERTt (second round)
+Lets check the correlations of ERTt with other relevant variables.
+
+```{r}
+#Check whether sex is also a significant predictor
+sexERTt_2nd <- lm(ERTt ~ sex, data = data_pooled_subset_imp)
+summary(sexERTt_2nd)$coefficients["sex", "Pr(>|t|)"] #Not significant
+
+sigpred_ERTt_2nd <- matcor2$r["ERTt",matcor2$P["ERTt",]<.05]; sigpred_ERTt_2nd #significant correlations of ERTt
+```
+
+
+## Imputation of CART_Gt, SET_Gt, EKM60t, ERTt (2nd imputation round)
+```{r}
+data_pooled_subset_imp2 <- data_pooled_subset_imp
+
+predictor_matrix2 <- make.predictorMatrix(data_pooled_subset_imp)
+predictor_matrix2[] <- 0
+
+#assign the significant predictors to the prediction matrix
+predictor_matrix2["CART_Gt", ] <- 
+  colnames(predictor_matrix2) %in% names(sigpred_CART_Gt)[!is.na(names(sigpred_CART_Gt))]
+predictor_matrix2["SET_Gt", ] <- 
+  colnames(predictor_matrix2) %in% names(sigpred_SET_Gt)[!is.na(names(sigpred_SET_Gt))]
+predictor_matrix2["EKM60t", ] <- 
+  colnames(predictor_matrix2) %in% names(sigpred_EKM60t)[!is.na(names(sigpred_EKM60t))]
+predictor_matrix2["ERTt", ] <- 
+  colnames(predictor_matrix2) %in% names(sigpred_ERTt_2nd)[!is.na(names(sigpred_ERTt_2nd))]
+
+
+#assign imputation medhods
+imputation_methods2 <- make.method(data_pooled_subset_imp)
+imputation_methods2[] <- ""  # Set all methods to "" initially
+imputation_methods2[c("CART_Gt", "SET_Gt", "EKM60t", "ERTt")] <- "pmm"  # Use "pmm" for ERTt
+
+#imputation
+data_pooled_subset_imp2 <- complete(mice(data_pooled_subset_imp, 
+                               method = imputation_methods2, 
+                               predictorMatrix = predictor_matrix2, 
+                               m = 1, 
+                               seed = 42), 1)
+```
+
+### Check after imputation part 2
+```{r}
+vis_miss(data_pooled_subset_imp2)
+```
+
+No missing values anymore
+
+
+# Final dataset
+## Characteristics
+```{r}
+data_final <- data_pooled_subset_imp2
+
+descriptives_data_final <- psych::describe(data_final[,-1]) %>%
+  select(n, min, max, mean, median, sd, skew, kurtosis); descriptives_data_final
+
+corr_data_final <- Hmisc:: rcorr(as.matrix(data_final[,-c(1:2)])); corr_data_final
+corr_data_final_r <- round(as.data.frame(corr_data_final$r), 3); corr_data_final_r
+corr_data_final_P <- round(as.data.frame(corr_data_final$P), 3); corr_data_final_P
+
+#knitr::kable(corr_data_final_r, format = "latex", booktabs = TRUE, caption = "Correlation matrix final dataset")
+#knitr::kable(corr_data_final_P, format = "latex", booktabs = TRUE, caption = "P-values corresponding to the correlations")
+```
+
+## Z-scores
+```{r}
+names_items_analysis <- c("EKM60t", "ERTt", "TASf1", "CART_Gt", "FP_Gt", "SET_Gt", "SNQt", "MBIt", "RSMSf1")
+data_final_Z <- cbind(data_final[, c("ID", "centerID", names_covariates)], round(scale(data_final[, names_items_analysis]), 4))
+```
+
+
+# Analyses 
+## CFA models
+```{r}
+#full 3 factor model
+m1_f3fm <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Allow factors to be correlated
+f1_P ~~ f2_U
+f1_P ~~ f3_BR
+f2_U ~~ f3_BR
+'
+
+#two factor model: f1 = f2
+m2_2fm_1eq2 <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Allow factors to be correlated
+f1_P ~~ 1*f2_U  # Fix correlation between f1_P and f2_U at 1
+f1_P ~~ f3_BR
+f2_U ~~ f3_BR
+'
+
+#model 3: two factor model: f1 = f3 (CART)
+m3_2fm_1eq3 <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Allow factors to be correlated
+f1_P ~~ f2_U  
+f1_P ~~ 1*f3_BR # Fix correlation between f1_P and f3_BR at 1
+f2_U ~~ f3_BR
+'
+
+#model 4: two factor model: f2 = f3 (CART)
+m4_2fm_2eq3 <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Allow factors to be correlated
+f1_P ~~ f2_U  
+f1_P ~~ f3_BR 
+f2_U ~~ 1*f3_BR # Fix correlation between f2_U and f3_BR at 1
+'
+
+#model 5: one factor model: f1 = f2 = f3 (CART)
+m5_1fm <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Fixing all interfactor correlations at 1
+f1_P ~~ 1*f2_U
+f1_P ~~ 1*f3_BR
+f2_U ~~ 1*f3_BR
+'
+
+#model 6: 3 one factor model: independent factors (CART)
+m6_3x1fm <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Fixing all interfactor correlations at 0
+f1_P ~~ 0*f2_U
+f1_P ~~ 0*f3_BR
+f2_U ~~ 0*f3_BR
+'
+
+ #model 6.3alt: 3 factor model; BR independent
+m6_3fm_BRindep <- '
+# Defining the factors (latent variables)
+f1_P =~ EKM60t + ERTt + TASf1
+f2_U =~ SET_Gt + FP_Gt + CART_Gt
+f3_BR =~ RSMSf1 + SNQt + MBIt
+
+# Fixing all interfactor correlations at 0
+f1_P ~~ f2_U
+f1_P ~~ 0*f3_BR
+f2_U ~~ 0*f3_BR
+'
+```
+
+
+## CFA EMC data (N=47)
+```{r}
+#model 1; EMC data
+fit_m1_EMC <- cfa(model = m1_f3fm, data = data_final_Z[data_final_Z$centerID == "EMC",])
+summ_m1_EMC <- summary(fit_m1_EMC, standardized = TRUE, fit.measures = TRUE)
+fm_m1_EMC <- fitMeasures(fit_m1_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 2; EMC data
+fit_m2_EMC <- cfa(model = m2_2fm_1eq2, data = data_final_Z[data_final_Z$centerID == "EMC",])
+summ_m2_EMC <- summary(fit_m2_EMC, standardized = TRUE, fit.measures = TRUE)
+fm_m2_EMC <- fitMeasures(fit_m2_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 3; EMC data
+fit_m3_EMC <- cfa(model = m3_2fm_1eq3, data = data_final_Z[data_final_Z$centerID == "EMC",])
+summ_m3_EMC <- summary(fit_m3_EMC, standardized = TRUE, fit.measures = TRUE)
+fm_m3_EMC <- fitMeasures(fit_m3_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 4; EMC data
+fit_m4_EMC <- cfa(model = m4_2fm_2eq3, data = data_final_Z[data_final_Z$centerID == "EMC",])
+summ_m4_EMC <- summary(fit_m4_EMC, standardized = TRUE, fit.measures = TRUE)
+fm_m4_EMC <- fitMeasures(fit_m4_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 5; EMC data
+fit_m5_EMC <- cfa(model = m5_1fm, data = data_final_Z[data_final_Z$centerID == "EMC",])
+summ_m5_EMC <- summary(fit_m5_EMC, standardized = TRUE, fit.measures = TRUE)
+fm_m5_EMC <- fitMeasures(fit_m5_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+# #model 6; EMC data
+# fit_m6_EMC <- cfa(model = m6_3x1fm, data = data_final_Z[data_final_Z$centerID == "EMC",])
+# summ_m6_EMC <- summary(fit_m6_EMC, standardized = TRUE, fit.measures = TRUE)
+# fm_m6_EMC <- fitMeasures(fit_m6_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+
+```{r}
+#model 6.3; EMC data
+fit_m6.3alt_EMC <- cfa(model = m6_3fm_BRindep, data = data_final_Z[data_final_Z$centerID == "EMC",])
+summ_m6.3alt_EMC <- summary(fit_m6.3alt_EMC, standardized = TRUE, fit.measures = TRUE)
+fm_m6.3alt_EMC <- fitMeasures(fit_m6.3alt_EMC, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+
+
+## CFA pooled data (N=128)
+```{r}
+#model 1; pooled data
+fit_m1_pld <- cfa(model = m1_f3fm, data = data_final_Z)
+summ_m1_pld <- summary(fit_m1_pld, standardized = TRUE, fit.measures = TRUE)
+fm_m1_pld <- fitMeasures(fit_m1_pld, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 2; pooled data
+fit_m2_pld <- cfa(model = m2_2fm_1eq2, data = data_final_Z)
+summ_m2_pld <- summary(fit_m2_pld, standardized = TRUE, fit.measures = TRUE)
+fm_m2_pld <- fitMeasures(fit_m2_pld, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 3; pooled data
+fit_m3_pld <- cfa(model = m3_2fm_1eq3, data = data_final_Z)
+summ_m3_pld <- summary(fit_m3_pld, standardized = TRUE, fit.measures = TRUE)
+fm_m3_pld <- fitMeasures(fit_m3_pld, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 4; pooled data
+fit_m4_pld <- cfa(model = m4_2fm_2eq3, data = data_final_Z)
+summ_m4_pld <- summary(fit_m4_pld, standardized = TRUE, fit.measures = TRUE)
+fm_m4_pld <- fitMeasures(fit_m4_pld, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 5; pooled data
+fit_m5_pld <- cfa(model = m5_1fm, data = data_final_Z)
+summ_m5_pld <- summary(fit_m5_pld, standardized = TRUE, fit.measures = TRUE)
+fm_m5_pld <- fitMeasures(fit_m5_pld, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+```{r}
+#model 6; pooled data
+fit_m6_pld <- cfa(model = m6_3x1fm, data = data_final_Z)
+summ_m6_pld <- summary(fit_m6_pld, standardized = TRUE, fit.measures = TRUE)
+fm_m6_pld <- fitMeasures(fit_m6_pld, c("npar", "chisq", "df", "pvalue", "aic", "srmr", "cfi", "ifi", "nfi", "rmsea", "bic"))
+```
+
+
+
+
+## SEM models
+
+## SEM EMC data (N=47)
+
+# Results
+## CFA EMC data
+### Fit indices
+```{r}
+results_CFA_EMC <- data.frame(round(rbind(fm_m1_EMC, fm_m2_EMC, fm_m3_EMC, fm_m4_EMC, fm_m5_EMC
+                                          #, fm_m6_EMC
+                                          ), 3))
+modelNames_CFA <- c("Full three-factor", "Two-factor: P = U", "Two-factor: P = BR", "Two-factor: U = BR", "One-factor: P = U = BR"
+                    #, "Independent three factor"
+                    )
+rownames(results_CFA_EMC) <- NULL
+results_CFA_EMC <- cbind(Model = modelNames_CFA, results_CFA_EMC)
+results_CFA_EMC
+results_CFA_EMC[,c("Model", "npar", "df", "chisq", "pvalue", "aic", "bic", "srmr", "cfi", "ifi")]
+```
+### Model comparisson
+```{r}
+anova(fit_m1_EMC, fit_m2_EMC)
+anova(fit_m1_EMC, fit_m3_EMC)
+anova(fit_m1_EMC, fit_m4_EMC)
+anova(fit_m1_EMC, fit_m5_EMC)
+#anova(fit_m1_EMC, fit_m6_EMC)
+```
+
+### Favoured model
+```{r}
+est_par_CFA_EMC <- parameterEstimates(fit_m1_EMC, standardized = TRUE)
+rownames(est_par_CFA_EMC) <- NULL
+est_par_CFA_EMC
+```
+
+
+## CFA pooled data
+### Fit indices
+```{r}
+results_CFA_pld <- data.frame(round(rbind(fm_m1_pld, fm_m2_pld, fm_m3_pld, fm_m4_pld, fm_m5_pld, fm_m6_pld), 3))
+modelNames_CFA <- c("Full three-factor", "Two-factor: P = U", "Two-factor: P = BR", "Two-factor: U = BR", "One-factor: P = U = BR", "Independent three factor")
+rownames(results_CFA_pld) <- NULL
+results_CFA_pld <- cbind(Model = modelNames_CFA, results_CFA_pld)
+results_CFA_pld
+```
+### Model comparisson
+```{r}
+anova(fit_m1_pld, fit_m2_pld)
+anova(fit_m1_pld, fit_m3_pld)
+anova(fit_m1_pld, fit_m4_pld)
+anova(fit_m1_pld, fit_m5_pld)
+anova(fit_m1_pld, fit_m6_pld)
+```
+
+```{r}
+# anova(fit_m2_pld, fit_m5_pld)
+# anova(fit_m3_pld, fit_m5_pld)
+# anova(fit_m4_pld, fit_m5_pld)
+```
+
+### Favoured model
+```{r}
+est_par_CFA_pld <- parameterEstimates(fit_m1_pld, standardized = TRUE)
+rownames(est_par_CFA_pld) <- NULL
+est_par_CFA_pld
+```
+
